@@ -61,3 +61,11 @@ OS
 Team
 The generated code should be production-minded, object-oriented, and organized as a CLI ETL tool for CMDB Excel imports.
 some sample data should be generated to test the correct behavior.
+
+
+
+
+Coudl you simply the cli experience:
+     - create separate cli, one for each table server, IP aaddress to avoid using the 1st parametr (load-server)
+     - the one cmdb_model.xlsx must be used both for input and output, but when writing the output (mdb_model.xlsx), a backup copy should be made with a time stamp
+     - a configuration file providing path to file, directory configuration

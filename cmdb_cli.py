@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
+import shutil
 import sqlite3
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -11,15 +14,133 @@ import pandas as pd
 
 
 SUPPORTED_TABLES = {
+    "server": "Server",
     "load-server": "Server",
+    "localisation": "Localisation",
     "load-localisation": "Localisation",
+    "application": "Application",
     "load-application": "Application",
+    "user": "User",
     "load-user": "User",
+    "ip-address": "IP address",
     "load-ip-address": "IP address",
+    "vlan": "VLAN",
     "load-vlan": "VLAN",
+    "os": "OS",
     "load-os": "OS",
+    "team": "Team",
     "load-team": "Team",
 }
+
+
+@dataclass(slots=True)
+class CMDBConfig:
+    sql_schema_path: Path
+    cmdb_model: Path
+    backup_dir: Path | None = None
+    data_dir: Path | None = None
+    map_dir: Path | None = None
+    normalization_dir: Path | None = None
+    tables: dict[str, dict[str, str]] = field(default_factory=dict)
+    base_dir: Path | None = None
+
+    @classmethod
+    def default(cls) -> "CMDBConfig":
+        base_dir = Path(__file__).resolve().parent
+        return cls(
+            sql_schema_path=base_dir / "db" / "cmdb_2026-06-28T15_49_08.585Z.sql",
+            cmdb_model=base_dir / "sample_data" / "cmdb_model.xlsx",
+            backup_dir=base_dir / "backup",
+            data_dir=base_dir / "sample_data",
+            map_dir=base_dir / "sample_data",
+            normalization_dir=base_dir / "sample_data",
+            tables={},
+            base_dir=base_dir,
+        )
+
+    @classmethod
+    def from_json(cls, config_path: Path) -> "CMDBConfig":
+        raw_config = json.loads(config_path.read_text(encoding="utf-8"))
+        base_dir = config_path.parent
+        return cls(
+            sql_schema_path=cls._resolve_path(raw_config.get("sql_schema_path"), base_dir)
+            or base_dir / "db" / "cmdb_2026-06-28T15_49_08.585Z.sql",
+            cmdb_model=cls._resolve_path(raw_config.get("cmdb_model"), base_dir)
+            or base_dir / "sample_data" / "cmdb_model.xlsx",
+            backup_dir=cls._resolve_path(raw_config.get("backup_dir"), base_dir),
+            data_dir=cls._resolve_path(raw_config.get("data_dir"), base_dir),
+            map_dir=cls._resolve_path(raw_config.get("map_dir"), base_dir),
+            normalization_dir=cls._resolve_path(raw_config.get("normalization_dir"), base_dir),
+            tables=raw_config.get("tables", {}),
+            base_dir=base_dir,
+        )
+
+    @staticmethod
+    def _resolve_path(value: Any, base_dir: Path) -> Path | None:
+        if value is None:
+            return None
+        path = Path(str(value))
+        return path if path.is_absolute() else base_dir / path
+
+    def resolve_path(self, value: str | None) -> Path | None:
+        if value is None:
+            return None
+        return self._resolve_path(value, self.base_dir or Path.cwd())
+
+    def _table_config_for(self, command: str) -> dict[str, str]:
+        if command in self.tables:
+            return self.tables[command]
+        alias = command.removeprefix("load-")
+        return self.tables.get(alias, {})
+
+    def resolve_data_file(self, command: str, explicit_path: str | None) -> Path:
+        if explicit_path:
+            return self.resolve_path(explicit_path)
+        table_config = self._table_config_for(command)
+        if "data_file" in table_config:
+            return self._resolve_path(table_config["data_file"], self.base_dir or Path.cwd())
+        if self.data_dir:
+            command_name = command.removeprefix("load-").replace("-", "_")
+            return self.data_dir / f"{command_name}_data.xlsx"
+        raise ValueError(
+            f"Data file for command '{command}' is missing. Provide --data-file or configure data_dir/table data_file."
+        )
+
+    def resolve_map_file(self, command: str, explicit_path: str | None) -> Path:
+        if explicit_path:
+            return self.resolve_path(explicit_path)
+        table_config = self._table_config_for(command)
+        if "map_file" in table_config:
+            return self._resolve_path(table_config["map_file"], self.base_dir or Path.cwd())
+        if self.map_dir:
+            command_name = command.removeprefix("load-").replace("-", "_")
+            return self.map_dir / f"{command_name}_mapping.xlsx"
+        raise ValueError(
+            f"Mapping file for command '{command}' is missing. Provide --map-file or configure map_dir/table map_file."
+        )
+
+    def resolve_normalization_file(self, command: str, explicit_path: str | None) -> Path:
+        if explicit_path:
+            return self.resolve_path(explicit_path)
+        table_config = self._table_config_for(command)
+        if "normalization_file" in table_config:
+            return self._resolve_path(table_config["normalization_file"], self.base_dir or Path.cwd())
+        if self.normalization_dir:
+            command_name = command.removeprefix("load-").replace("-", "_")
+            return self.normalization_dir / f"{command_name}_normalization.xlsx"
+        raise ValueError(
+            f"Normalization file for command '{command}' is missing. Provide --normalization-file or configure normalization_dir/table normalization_file."
+        )
+
+    def resolve_input_model(self, explicit_path: str | None) -> Path:
+        if explicit_path:
+            return self.resolve_path(explicit_path)
+        return self.cmdb_model
+
+    def resolve_output_file(self, explicit_path: str | None) -> Path:
+        if explicit_path:
+            return self.resolve_path(explicit_path)
+        return self.cmdb_model
 
 
 class CMDBSchema:
@@ -158,37 +279,56 @@ class NormalizationConfig:
     @classmethod
     def from_excel(cls, workbook_path: Path, table_name: str) -> "NormalizationConfig":
         workbook = pd.ExcelFile(workbook_path, engine="openpyxl")
-        if table_name in workbook.sheet_names:
-            frame = pd.read_excel(workbook_path, sheet_name=table_name, engine="openpyxl")
-        elif len(workbook.sheet_names) == 1:
-            frame = pd.read_excel(workbook_path, sheet_name=workbook.sheet_names[0], engine="openpyxl")
-        else:
-            raise ValueError(
-                f"Normalization workbook '{workbook_path}' must contain a sheet named '{table_name}' or exactly one sheet."
-            )
-
-        frame = frame.rename(columns=str)
-        missing_columns = {"field", "source_value", "target_value"} - set(frame.columns)
-        if missing_columns:
-            raise ValueError(
-                f"Normalization file '{workbook_path}' is missing required columns: {', '.join(sorted(missing_columns))}."
-            )
-
         rules: list[NormalizationRule] = []
-        for _, row in frame.iterrows():
-            table = row.get("table") if "table" in frame.columns else None
-            field = str(row["field"]).strip()
-            if not field:
-                continue
-            if table is None or pd.isna(table) or str(table).strip() == table_name:
-                rules.append(
-                    NormalizationRule(
-                        field=field,
-                        source_value=row["source_value"],
-                        target_value=row["target_value"],
-                        table=str(table).strip() if pd.notna(table) else None,
+
+        if table_name in workbook.sheet_names:
+            sheet_names = [table_name]
+        elif len(workbook.sheet_names) == 1:
+            sheet_names = [workbook.sheet_names[0]]
+        else:
+            sheet_names = workbook.sheet_names
+
+        for sheet_name in sheet_names:
+            frame = pd.read_excel(workbook_path, sheet_name=sheet_name, engine="openpyxl")
+            frame = frame.rename(columns=str)
+            if {"field", "source_value", "target_value"}.issubset(frame.columns):
+                for _, row in frame.iterrows():
+                    field = str(row["field"]).strip()
+                    if not field:
+                        continue
+                    rules.append(
+                        NormalizationRule(
+                            field=field,
+                            source_value=row["source_value"],
+                            target_value=row["target_value"],
+                            table=None,
+                        )
                     )
-                )
+                continue
+
+            if {"source_value", "target_value"}.issubset(frame.columns):
+                field_name = str(sheet_name).strip()
+                if not field_name:
+                    continue
+                for _, row in frame.iterrows():
+                    source_value = row["source_value"]
+                    target_value = row["target_value"]
+                    if pd.isna(source_value) and pd.isna(target_value):
+                        continue
+                    rules.append(
+                        NormalizationRule(
+                            field=field_name,
+                            source_value=source_value,
+                            target_value=target_value,
+                            table=None,
+                        )
+                    )
+                continue
+
+            raise ValueError(
+                f"Normalization sheet '{sheet_name}' in '{workbook_path}' must contain either 'field/source_value/target_value' columns or 'source_value/target_value' columns."
+            )
+
         return cls(rules=rules)
 
     def apply(self, table_name: str, frame: pd.DataFrame) -> pd.DataFrame:
@@ -329,25 +469,34 @@ class CMDBCLI:
         parser = argparse.ArgumentParser(
             description="CMDB ETL CLI: import Excel data into an in-memory CMDB and export a reusable Excel workbook."
         )
+        parser.add_argument(
+            "--config",
+            required=False,
+            help="Optional JSON config file defining default paths and directories",
+        )
         subparsers = parser.add_subparsers(dest="command", required=True)
+
+        export_parser = subparsers.add_parser("export-server-inventory", help="Export a flattened server inventory workbook")
+        export_parser.add_argument("--input-model", required=True, help="Excel workbook representing the current CMDB data model")
+        export_parser.add_argument("--output-file", required=True, help="Path to the Excel workbook that will receive the inventory export")
 
         for subcommand, table_name in SUPPORTED_TABLES.items():
             command_parser = subparsers.add_parser(subcommand, help=f"Load data into the {table_name} table")
-            command_parser.add_argument("--data-file", required=True, help="Excel file containing rows to import")
-            command_parser.add_argument("--map-file", required=True, help="Excel file defining source-to-target column mapping")
+            command_parser.add_argument("--data-file", required=False, help="Excel file containing rows to import")
+            command_parser.add_argument("--map-file", required=False, help="Excel file defining source-to-target column mapping")
             command_parser.add_argument(
                 "--normalization-file",
-                required=True,
+                required=False,
                 help="Excel file defining normalization rules for target values",
             )
             command_parser.add_argument(
                 "--input-model",
                 required=False,
-                help="Optional existing Excel workbook representing the current CMDB data model",
+                help="Excel workbook representing the current CMDB data model",
             )
             command_parser.add_argument(
                 "--output-file",
-                required=True,
+                required=False,
                 help="Path to the Excel workbook that will receive the updated CMDB state",
             )
 
@@ -356,22 +505,174 @@ class CMDBCLI:
     def run(self, argv: list[str] | None = None) -> None:
         parser = self.build_parser()
         args = parser.parse_args(argv)
+        config = CMDBConfig.from_json(Path(args.config)) if args.config else CMDBConfig.default()
+        if args.command == "export-server-inventory":
+            self.export_server_inventory(Path(args.input_model), Path(args.output_file), config)
+            return
         if args.command not in SUPPORTED_TABLES:
             raise ValueError(f"Unknown command: {args.command}")
         table_name = SUPPORTED_TABLES[args.command]
-        self._execute_command(table_name, args)
+        self._execute_command(table_name, args, config)
 
-    def _execute_command(self, table_name: str, args: argparse.Namespace) -> None:
+    def _backup_existing_output(self, output_path: Path, backup_dir: Path | None) -> None:
+        if not output_path.exists():
+            return
+
+        backup_root = backup_dir or output_path.parent
+        backup_root.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        backup_path = backup_root / f"{output_path.stem}_{timestamp}{output_path.suffix}"
+        shutil.copy2(output_path, backup_path)
+        print(f"Backed up existing output file to {backup_path}")
+
+    def _backup_database_dump(self, connection: sqlite3.Connection, output_path: Path, backup_dir: Path | None) -> Path:
+        backup_root = backup_dir or output_path.parent
+        backup_root.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        backup_path = backup_root / f"{output_path.stem}_{timestamp}.sqlite"
+        dump_connection = sqlite3.connect(backup_path)
+        try:
+            connection.backup(dump_connection)
+        finally:
+            dump_connection.close()
+        print(f"Backed up SQLite database to {backup_path}")
+        return backup_path
+
+    @staticmethod
+    def _flatten_field_prefix(column_name: str) -> str:
+        cleaned = str(column_name)
+        for suffix in ("_id", "_ID"):
+            if cleaned.endswith(suffix):
+                cleaned = cleaned[: -len(suffix)]
+                break
+        return f"{cleaned.replace(' ', '_')}_"
+
+    @staticmethod
+    def _derive_table_name(column_name: str) -> str | None:
+        cleaned = str(column_name).strip()
+        for suffix in ("_id", "_ID"):
+            if cleaned.endswith(suffix):
+                cleaned = cleaned[: -len(suffix)]
+                break
+        if not cleaned:
+            return None
+        lowered = cleaned.lower()
+        if lowered.startswith("ip") or lowered.endswith("address"):
+            return "IP address"
+        if lowered.startswith("local") or lowered.endswith("location"):
+            return "Localisation"
+        if lowered.startswith("owner") or lowered.startswith("referant") or lowered.startswith("support"):
+            return "User"
+        if lowered.startswith("os"):
+            return "OS"
+        if lowered.startswith("vlan"):
+            return "VLAN"
+        return None
+
+    def _collect_related_rows(
+        self,
+        connection: sqlite3.Connection,
+        table_name: str,
+        row: sqlite3.Row,
+        prefix: str = "",
+        visited: set[str] | None = None,
+    ) -> dict[str, Any]:
+        visited = visited or set()
+        table_key = table_name
+        if table_key in visited:
+            return {}
+        visited = set(visited)
+        visited.add(table_key)
+
+        row_data: dict[str, Any] = {}
+        for key in row.keys():
+            row_data[f"{prefix}{key}"] = row[key]
+
+        handled_columns: set[str] = set()
+        cursor = connection.execute(f'PRAGMA foreign_key_list("{table_name}")')
+        for foreign_key in cursor.fetchall():
+            fk_table = foreign_key[2]
+            fk_column = foreign_key[3]
+            fk_to_column = foreign_key[4]
+            if not fk_column or not fk_to_column:
+                continue
+            handled_columns.add(fk_column)
+            fk_value = row[fk_column] if fk_column in row.keys() else None
+            if fk_value is None or fk_value == "":
+                continue
+            related_row = connection.execute(
+                f'SELECT * FROM "{fk_table}" WHERE "{fk_to_column}" = ?', (fk_value,)
+            ).fetchone()
+            if related_row is None:
+                continue
+            child_prefix = f"{prefix}{self._flatten_field_prefix(fk_column)}"
+            related_data = self._collect_related_rows(connection, fk_table, related_row, prefix=child_prefix, visited=visited)
+            for key, value in related_data.items():
+                row_data[key] = value
+
+        for column_name in row.keys():
+            if column_name in handled_columns or not column_name.endswith(("_id", "_ID")):
+                continue
+            candidate_table = self._derive_table_name(column_name)
+            if candidate_table is None or candidate_table not in self.schema.table_names or candidate_table == table_name:
+                continue
+            fk_value = row[column_name]
+            if fk_value is None or fk_value == "":
+                continue
+            related_row = connection.execute(
+                f'SELECT * FROM "{candidate_table}" WHERE "id" = ?', (fk_value,)
+            ).fetchone()
+            if related_row is None:
+                continue
+            child_prefix = f"{prefix}{self._flatten_field_prefix(column_name)}"
+            related_data = self._collect_related_rows(connection, candidate_table, related_row, prefix=child_prefix, visited=visited)
+            for key, value in related_data.items():
+                row_data[key] = value
+
+        if table_name == "VLAN" and "router" in row.keys():
+            router_value = row["router"]
+            if router_value not in (None, ""):
+                router_row = connection.execute('SELECT * FROM "Server" WHERE "id" = ?', (router_value,)).fetchone()
+                if router_row is not None:
+                    child_prefix = f"{prefix}Router_"
+                    related_data = self._collect_related_rows(connection, "Server", router_row, prefix=child_prefix, visited=visited)
+                    for key, value in related_data.items():
+                        row_data[key] = value
+
+        return row_data
+
+    def export_server_inventory(self, input_model_path: Path, output_path: Path, config: CMDBConfig | None = None) -> None:
+        config = config or CMDBConfig.default()
         connection = self.schema.create_database()
-        if args.input_model:
-            input_model_path = Path(args.input_model)
-            if not input_model_path.exists():
-                raise FileNotFoundError(f"Input model file not found: {input_model_path}")
+        if input_model_path.exists():
             self.schema.load_excel_data_model(connection, input_model_path)
+        else:
+            raise FileNotFoundError(f"Input model file not found: {input_model_path}")
 
-        mapping_config = MappingConfig.from_excel(Path(args.map_file), table_name)
-        normalization_config = NormalizationConfig.from_excel(Path(args.normalization_file), table_name)
-        source_frame = pd.read_excel(Path(args.data_file), engine="openpyxl")
+        server_rows = connection.execute('SELECT * FROM "Server"').fetchall()
+        expanded_rows: list[dict[str, Any]] = []
+        for row in server_rows:
+            expanded = self._collect_related_rows(connection, "Server", row)
+            expanded_rows.append(expanded)
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        frame = pd.DataFrame(expanded_rows)
+        frame.to_excel(output_path, index=False)
+        print(f"Wrote server inventory workbook to {output_path}")
+
+    def _execute_command(self, table_name: str, args: argparse.Namespace, config: CMDBConfig) -> None:
+        connection = self.schema.create_database()
+        input_model_path = config.resolve_input_model(args.input_model)
+        if input_model_path and input_model_path.exists():
+            self.schema.load_excel_data_model(connection, input_model_path)
+        elif args.input_model:
+            raise FileNotFoundError(f"Input model file not found: {input_model_path}")
+
+        mapping_config = MappingConfig.from_excel(config.resolve_map_file(args.command, args.map_file), table_name)
+        normalization_config = NormalizationConfig.from_excel(
+            config.resolve_normalization_file(args.command, args.normalization_file), table_name
+        )
+        source_frame = pd.read_excel(config.resolve_data_file(args.command, args.data_file), engine="openpyxl")
 
         importer = TableImporter(
             connection=connection,
@@ -382,7 +683,9 @@ class CMDBCLI:
         )
         importer.import_rows(source_frame)
 
-        output_path = Path(args.output_file)
+        output_path = config.resolve_output_file(args.output_file)
+        self._backup_existing_output(output_path, config.backup_dir)
+        self._backup_database_dump(connection, output_path, config.backup_dir)
         self.schema.export_db_to_excel(connection, output_path)
         print(f"Wrote updated CMDB workbook to {output_path}")
 

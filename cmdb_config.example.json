@@ -1,0 +1,20 @@
+{
+  "sql_schema_path": "db/cmdb_2026-06-28T15_49_08.585Z.sql",
+  "cmdb_model": "model/cmdb_model.xlsx",
+  "backup_dir": "backup",
+  "data_dir": "data",
+  "map_dir": "mapping",
+  "normalization_dir": "normalization",
+  "tables": {
+    "server": {
+      "data_file": "data/server_data.xlsx",
+      "map_file": "mapping/server_mapping.xlsx",
+      "normalization_file": "normalization/server_normalization.xlsx"
+    },
+    "ip-address": {
+      "data_file": "data/ip_address_data.xlsx",
+      "map_file": "mapping/ip_address_mapping.xlsx",
+      "normalization_file": "normalization/ip_address_normalization.xlsx"
+    }
+  }
+}
