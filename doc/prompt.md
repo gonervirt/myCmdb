@@ -10,7 +10,7 @@ Please ask any question you need to make sure the prompt generated will be ok.
 
 Use the SQL schema in cmdb_2026-06-28T15_49_08.585Z.sql as the CMDB data model.
 
-Build a Python CLI application with a senior-engineer object-oriented design and argparse for the command interface.
+Build several Python CLI application with a senior-engineer object-oriented design and argparse for the command interface.
 
 Requirements:
 
@@ -48,6 +48,7 @@ use sqlite3 or SQLAlchemy for the in-memory database
 validate mapping and normalization before insert
 report clear errors on missing columns, invalid mappings, or normalization mismatches
 keep import pipeline reusable and maintainable
+each cli command covers one load in table (but each load can update other table)
 Schema tables:
 
 Server
@@ -59,3 +60,4 @@ VLAN
 OS
 Team
 The generated code should be production-minded, object-oriented, and organized as a CLI ETL tool for CMDB Excel imports.
+some sample data should be generated to test the correct behavior.
