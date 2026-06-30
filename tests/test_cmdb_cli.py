@@ -3,7 +3,15 @@ from pathlib import Path
 
 import pandas as pd
 
-from cmdb_cli import CMDBCLI, CMDBConfig, CMDBSchema, NormalizationConfig
+from cmdb_cli import (
+    CMDBCLI,
+    CMDBConfig,
+    CMDBSchema,
+    MappingConfig,
+    MappingRule,
+    NormalizationConfig,
+    TableImporter,
+)
 
 
 def test_schema_and_export_round_trip(tmp_path: Path) -> None:
@@ -54,6 +62,61 @@ def test_normalization_config_supports_one_sheet_per_field(tmp_path: Path) -> No
 
     assert normalized.loc[0, "Owner_id"] == "user-001"
     assert normalized.loc[0, "OS_id"] == "os-001"
+
+
+def test_table_importer_uses_schema_defaults_and_star_prefix_values() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.execute('CREATE TABLE "TestTable" (id INTEGER PRIMARY KEY, name TEXT DEFAULT "fallback", flag TEXT)')
+
+    schema = CMDBSchema(Path("db/cmdb_2026-06-28T15_49_08.585Z.sql"))
+    mapping_config = MappingConfig(
+        rules=[
+            MappingRule(source_column="source_name", target_column="name"),
+            MappingRule(source_column="source_flag", target_column="flag"),
+        ]
+    )
+    normalization_config = NormalizationConfig(rules=[])
+    importer = TableImporter(connection, schema, "TestTable", mapping_config, normalization_config)
+
+    source_frame = pd.DataFrame([{"source_name": "", "source_flag": "*override"}])
+    importer.import_rows(source_frame)
+
+    row = connection.execute('SELECT name, flag FROM "TestTable"').fetchone()
+    assert row[0] == "fallback"
+    assert row[1] == "override"
+
+
+def test_table_importer_updates_existing_primary_key_rows_with_merge_rules() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.execute('CREATE TABLE "TestTable" (id INTEGER PRIMARY KEY, name TEXT, email TEXT)')
+    connection.execute('INSERT INTO "TestTable" (id, name, email) VALUES (?, ?, ?)', (1, "db-name", ""))
+    connection.execute('INSERT INTO "TestTable" (id, name, email) VALUES (?, ?, ?)', (2, "", ""))
+    connection.commit()
+
+    schema = CMDBSchema(Path("db/cmdb_2026-06-28T15_49_08.585Z.sql"))
+    mapping_config = MappingConfig(
+        rules=[
+            MappingRule(source_column="source_id", target_column="id"),
+            MappingRule(source_column="source_name", target_column="name"),
+            MappingRule(source_column="source_email", target_column="email"),
+        ]
+    )
+    normalization_config = NormalizationConfig(rules=[])
+    importer = TableImporter(connection, schema, "TestTable", mapping_config, normalization_config)
+
+    source_frame = pd.DataFrame(
+        [
+            {"source_id": 1, "source_name": "import-name", "source_email": ""},
+            {"source_id": 2, "source_name": "", "source_email": "import-email"},
+        ]
+    )
+    importer.import_rows(source_frame)
+
+    row_one = connection.execute('SELECT name, email FROM "TestTable" WHERE id = 1').fetchone()
+    row_two = connection.execute('SELECT name, email FROM "TestTable" WHERE id = 2').fetchone()
+
+    assert row_one == ("import-name", "")
+    assert row_two == ("", "import-email")
 
 
 def test_database_backup_dump_is_created_on_save(tmp_path: Path) -> None:

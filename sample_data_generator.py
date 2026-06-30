@@ -58,7 +58,10 @@ def build_sample_workbooks(out_dir: Path | None = None) -> None:
 
     model = {
         "Server": pd.DataFrame(
-            [{"id": "srv-001", "Name": "srv-app-01", "Owner_id": "user-001", "Localisation_id": "loc-001", "OS_id": "os-001", "IP_Address_id": "ip-001"}]
+            [
+                {"id": "srv-001", "Name": "srv-app-01", "Owner_id": "user-001", "Localisation_id": "loc-001", "OS_id": "os-001", "IP_Address_id": "ip-001"},
+                {"id": "router-001", "Name": "router-001", "Owner_id": "user-001", "Localisation_id": "loc-001", "OS_id": "os-001", "IP_Address_id": "ip-001"},
+            ]
         ),
         "Localisation": pd.DataFrame([{"id": "loc-001", "Country": "FR", "City": "Paris", "Room": "HQ"}]),
         "Application": pd.DataFrame([

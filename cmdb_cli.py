@@ -391,15 +391,58 @@ class TableImporter:
                 f"{', '.join(unknown_target_columns)}"
             )
 
+        for column in mapped_frame.columns:
+            if column not in self.table_columns:
+                continue
+            mapped_frame[column] = mapped_frame[column].apply(lambda value: self._normalize_mapped_value(column, value))
+
         normalized_frame = self.normalization_config.apply(self.table_name, mapped_frame)
         self._validate_required_columns(normalized_frame)
         return normalized_frame.reindex(columns=self.table_columns).copy()
+
+    def _normalize_mapped_value(self, target_column: str, value: Any) -> Any:
+        if pd.isna(value):
+            return None
+
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped == "":
+                return self._resolve_default_value(target_column)
+            if stripped.startswith("*"):
+                return stripped[1:].strip()
+            return stripped
+
+        return value
+
+    def _resolve_default_value(self, target_column: str) -> Any:
+        cursor = self.connection.execute(f'PRAGMA table_info("{self.table_name}")')
+        for row in cursor.fetchall():
+            if row[1] == target_column:
+                default_value = row[4]
+                if default_value is None:
+                    return None
+                if isinstance(default_value, str):
+                    value = default_value.strip()
+                    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+                        return value[1:-1]
+                    return value
+                return default_value
+        return None
 
     def _validate_required_columns(self, frame: pd.DataFrame) -> None:
         missing_required_columns = [column for column in self.required_columns if column not in frame.columns]
         generated_columns = [column for column in missing_required_columns if column in self.primary_keys]
         for column in generated_columns:
             frame[column] = frame.index.map(lambda row_index: self._generate_value_for_column(frame, column, row_index))
+
+        for column in self.primary_keys:
+            if column not in frame.columns:
+                continue
+            missing_values = frame[column].isna() | frame[column].eq("")
+            if missing_values.any():
+                frame.loc[missing_values, column] = frame.index[missing_values].map(
+                    lambda row_index: self._generate_value_for_column(frame, column, row_index)
+                )
 
         missing_required_columns = [column for column in self.required_columns if column not in frame.columns]
         if missing_required_columns:
@@ -450,14 +493,81 @@ class TableImporter:
             return
 
         columns = [column for column in frame.columns if column in self.table_columns]
-        placeholders = ", ".join("?" for _ in columns)
-        quoted_columns = ", ".join(f'"{column}"' for column in columns)
-        sql = (
-            f'INSERT OR REPLACE INTO "{self.table_name}" ({quoted_columns}) VALUES ({placeholders})'
-        )
-        rows = [tuple(row[column] for column in columns) for _, row in frame.iterrows()]
-        self.connection.executemany(sql, rows)
+        for _, row in frame.iterrows():
+            self._upsert_row(columns, row)
         self.connection.commit()
+
+    def _upsert_row(self, columns: list[str], row: pd.Series) -> None:
+        primary_key_values = [self._normalize_value(row[column]) for column in self.primary_keys if column in row.index]
+        if not primary_key_values:
+            self._insert_row(columns, row)
+            return
+
+        select_sql = (
+            f'SELECT * FROM "{self.table_name}" WHERE '
+            + " AND ".join(f'"{column}" = ?' for column in self.primary_keys if column in row.index)
+        )
+        cursor = self.connection.execute(select_sql, primary_key_values)
+        existing_row = cursor.fetchone()
+        if existing_row is None:
+            self._insert_row(columns, row)
+            return
+
+        existing_values = dict(zip([col[0] for col in cursor.description], existing_row)) if cursor.description else {}
+        update_assignments: list[str] = []
+        update_values: list[Any] = []
+        for column in columns:
+            if column in self.primary_keys:
+                continue
+            incoming_value = self._normalize_value(row[column])
+            existing_value = existing_values.get(column)
+            merged_value = self._merge_column_value(existing_value, incoming_value)
+            update_assignments.append(f'"{column}" = ?')
+            update_values.append(merged_value)
+
+        if not update_assignments:
+            return
+
+        where_clause = " AND ".join(f'"{column}" = ?' for column in self.primary_keys if column in row.index)
+        update_sql = f'UPDATE "{self.table_name}" SET {", ".join(update_assignments)} WHERE {where_clause}'
+        self.connection.execute(update_sql, [*update_values, *primary_key_values])
+
+    def _insert_row(self, columns: list[str], row: pd.Series) -> None:
+        row_columns = [column for column in columns if column in row.index]
+        values = [self._normalize_value(row[column]) for column in row_columns]
+        quoted_columns = ", ".join(f'"{column}"' for column in row_columns)
+        placeholders = ", ".join("?" for _ in row_columns)
+        self.connection.execute(
+            f'INSERT INTO "{self.table_name}" ({quoted_columns}) VALUES ({placeholders})',
+            values,
+        )
+
+    def _normalize_value(self, value: Any) -> Any:
+        if pd.isna(value):
+            return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped == "":
+                return None
+            return stripped
+        return value
+
+    def _merge_column_value(self, existing_value: Any, incoming_value: Any) -> Any:
+        if self._is_empty_value(incoming_value):
+            return existing_value
+        if self._is_empty_value(existing_value):
+            return incoming_value
+        return incoming_value
+
+    @staticmethod
+    def _is_empty_value(value: Any) -> bool:
+        if value is None:
+            return True
+        if pd.isna(value):
+            return True
+        if isinstance(value, str):
+            return value.strip() == ""
+        return False
 
 
 class CMDBCLI:
@@ -635,9 +745,16 @@ class CMDBCLI:
                 router_row = connection.execute('SELECT * FROM "Server" WHERE "id" = ?', (router_value,)).fetchone()
                 if router_row is not None:
                     child_prefix = f"{prefix}Router_"
-                    related_data = self._collect_related_rows(connection, "Server", router_row, prefix=child_prefix, visited=visited)
-                    for key, value in related_data.items():
-                        row_data[key] = value
+                    for key in router_row.keys():
+                        row_data[f"{child_prefix}{key}"] = router_row[key]
+
+        if table_name == "VLAN" and "id" in row.keys() and row["id"] not in (None, ""):
+            vlan_id = row["id"]
+            related_row = connection.execute('SELECT * FROM "IP address" WHERE "VLAN_id" = ?', (vlan_id,)).fetchone()
+            if related_row is not None:
+                child_prefix = f"{prefix}IP_Address_"
+                for key in related_row.keys():
+                    row_data[f"{child_prefix}{key}"] = related_row[key]
 
         return row_data
 
