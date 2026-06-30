@@ -183,6 +183,61 @@ def test_table_importer_updates_existing_primary_key_rows_with_merge_rules() -> 
     assert row_two == ("", "import-email")
 
 
+def test_table_importer_ignores_fully_empty_input_rows() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.execute('CREATE TABLE "Localisation" (id TEXT PRIMARY KEY, Country TEXT, City TEXT, Room TEXT)')
+
+    schema = CMDBSchema(Path("db/cmdb_2026-06-28T15_49_08.585Z.sql"))
+    mapping_config = MappingConfig(
+        rules=[
+            MappingRule(source_column="source_id", target_column="id"),
+            MappingRule(source_column="source_country", target_column="Country"),
+            MappingRule(source_column="source_city", target_column="City"),
+            MappingRule(source_column="source_room", target_column="Room"),
+        ]
+    )
+    normalization_config = NormalizationConfig(rules=[])
+    importer = TableImporter(connection, schema, "Localisation", mapping_config, normalization_config)
+
+    source_frame = pd.DataFrame(
+        [
+            {"source_id": "loc-001", "source_country": "FR", "source_city": "Paris", "source_room": "HQ"},
+            {"source_id": "", "source_country": "", "source_city": "", "source_room": ""},
+        ]
+    )
+    importer.import_rows(source_frame)
+
+    row_count = connection.execute('SELECT COUNT(*) FROM "Localisation"').fetchone()[0]
+    assert row_count == 1
+
+
+def test_table_importer_ignores_rows_with_empty_non_nullable_fields() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.execute('CREATE TABLE "ReqTable" (id TEXT PRIMARY KEY, name TEXT NOT NULL, note TEXT)')
+
+    schema = CMDBSchema(Path("db/cmdb_2026-06-28T15_49_08.585Z.sql"))
+    mapping_config = MappingConfig(
+        rules=[
+            MappingRule(source_column="source_id", target_column="id"),
+            MappingRule(source_column="source_name", target_column="name"),
+            MappingRule(source_column="source_note", target_column="note"),
+        ]
+    )
+    normalization_config = NormalizationConfig(rules=[])
+    importer = TableImporter(connection, schema, "ReqTable", mapping_config, normalization_config)
+
+    source_frame = pd.DataFrame(
+        [
+            {"source_id": "r-001", "source_name": "valid", "source_note": "ok"},
+            {"source_id": "r-002", "source_name": "", "source_note": "should-be-ignored"},
+        ]
+    )
+    importer.import_rows(source_frame)
+
+    rows = connection.execute('SELECT id, name, note FROM "ReqTable" ORDER BY id').fetchall()
+    assert rows == [("r-001", "valid", "ok")]
+
+
 def test_database_backup_dump_is_created_on_save(tmp_path: Path) -> None:
     cli = CMDBCLI(Path("db/cmdb_2026-06-28T15_49_08.585Z.sql"))
     connection = cli.schema.create_database()

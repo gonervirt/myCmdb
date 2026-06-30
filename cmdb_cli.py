@@ -389,6 +389,10 @@ class TableImporter:
         if frame.empty:
             return pd.DataFrame(columns=self.table_columns)
 
+        frame = frame.loc[~frame.apply(self._is_input_row_empty, axis=1)].copy()
+        if frame.empty:
+            return pd.DataFrame(columns=self.table_columns)
+
         valid_rules = [rule for rule in self.mapping_config.rules if rule.target_column in self.table_columns]
         source_rules = [rule for rule in valid_rules if rule.source_column]
         missing_source_columns = [rule.source_column for rule in source_rules if rule.source_column not in frame.columns]
@@ -418,8 +422,15 @@ class TableImporter:
             mapped_frame[column] = mapped_frame[column].apply(lambda value: self._normalize_mapped_value(column, value))
 
         normalized_frame = self.normalization_config.apply(self.table_name, mapped_frame)
-        self._validate_required_columns(normalized_frame)
-        return normalized_frame.reindex(columns=self.table_columns).copy()
+        valid_frame = self._validate_required_columns(normalized_frame)
+        return valid_frame.reindex(columns=self.table_columns).copy()
+
+    @classmethod
+    def _is_input_row_empty(cls, row: pd.Series) -> bool:
+        for value in row.values:
+            if not cls._is_empty_value(value):
+                return False
+        return True
 
     def _normalize_mapped_value(self, target_column: str, value: Any) -> Any:
         if pd.isna(value):
@@ -450,11 +461,17 @@ class TableImporter:
                 return default_value
         return None
 
-    def _validate_required_columns(self, frame: pd.DataFrame) -> None:
+    def _validate_required_columns(self, frame: pd.DataFrame) -> pd.DataFrame:
+        frame = frame.copy()
         missing_required_columns = [column for column in self.required_columns if column not in frame.columns]
         generated_columns = [column for column in missing_required_columns if column in self.primary_keys]
         for column in generated_columns:
             frame[column] = frame.index.map(lambda row_index: self._generate_value_for_column(frame, column, row_index))
+
+        for column in missing_required_columns:
+            if column in self.primary_keys:
+                continue
+            frame[column] = None
 
         for column in self.primary_keys:
             if column not in frame.columns:
@@ -465,12 +482,16 @@ class TableImporter:
                     lambda row_index: self._generate_value_for_column(frame, column, row_index)
                 )
 
-        missing_required_columns = [column for column in self.required_columns if column not in frame.columns]
-        if missing_required_columns:
-            raise ValueError(
-                f"Target table '{self.table_name}' requires columns that are not provided by mapping: "
-                f"{', '.join(missing_required_columns)}"
-            )
+        required_non_pk_columns = [column for column in self.required_columns if column not in self.primary_keys]
+        if required_non_pk_columns:
+            keep_mask = pd.Series(True, index=frame.index)
+            for column in required_non_pk_columns:
+                if column not in frame.columns:
+                    keep_mask &= False
+                    continue
+                missing_values = frame[column].isna() | frame[column].eq("")
+                keep_mask &= ~missing_values
+            frame = frame.loc[keep_mask].copy()
 
         for column in self.required_columns:
             if column not in frame.columns:
@@ -481,6 +502,8 @@ class TableImporter:
                 raise ValueError(
                     f"Required column '{column}' has empty values in rows {', '.join(str(row_number) for row_number in offending_rows)}."
                 )
+
+        return frame
 
     def _generate_value_for_column(self, frame: pd.DataFrame, column: str, row_index: int) -> Any:
         if column != "id":

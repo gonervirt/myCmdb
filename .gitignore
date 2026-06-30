@@ -1,3 +1,9 @@
 /.vscode
 /backup
 /model
+/__pycache__
+/*.pyc
+/*.pyo
+/*.pyd
+/*.swp
+/tests/__pycache__
