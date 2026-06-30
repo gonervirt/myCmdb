@@ -64,6 +64,25 @@ def test_normalization_config_supports_one_sheet_per_field(tmp_path: Path) -> No
     assert normalized.loc[0, "OS_id"] == "os-001"
 
 
+def test_mapping_config_supports_static_source_column_marker(tmp_path: Path) -> None:
+    workbook_path = tmp_path / "localisation_mapping.xlsx"
+    frame = pd.DataFrame(
+        [
+            {"source_column": "id", "target_column": "id"},
+            {"source_column": "source_country", "target_column": "Country"},
+            {"source_column": "*toto", "target_column": "City"},
+            {"source_column": "source_room", "target_column": "Room"},
+        ]
+    )
+    frame.to_excel(workbook_path, sheet_name="Localisation", index=False)
+
+    config = MappingConfig.from_excel(workbook_path, "Localisation")
+    city_rule = next(rule for rule in config.rules if rule.target_column == "City")
+
+    assert city_rule.source_column == ""
+    assert city_rule.static_value == "toto"
+
+
 def test_table_importer_uses_schema_defaults_and_star_prefix_values() -> None:
     connection = sqlite3.connect(":memory:")
     connection.execute('CREATE TABLE "TestTable" (id INTEGER PRIMARY KEY, name TEXT DEFAULT "fallback", flag TEXT)')
@@ -84,6 +103,51 @@ def test_table_importer_uses_schema_defaults_and_star_prefix_values() -> None:
     row = connection.execute('SELECT name, flag FROM "TestTable"').fetchone()
     assert row[0] == "fallback"
     assert row[1] == "override"
+
+
+def test_table_importer_uses_static_mapping_values_from_source_marker() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.execute('CREATE TABLE "Localisation" (id TEXT PRIMARY KEY, Country TEXT, City TEXT, Room TEXT)')
+
+    schema = CMDBSchema(Path("db/cmdb_2026-06-28T15_49_08.585Z.sql"))
+    mapping_config = MappingConfig(
+        rules=[
+            MappingRule(source_column="source_id", target_column="id"),
+            MappingRule(source_column="source_country", target_column="Country"),
+            MappingRule(source_column="", target_column="City", static_value="toto"),
+            MappingRule(source_column="source_room", target_column="Room"),
+        ]
+    )
+    normalization_config = NormalizationConfig(rules=[])
+    importer = TableImporter(connection, schema, "Localisation", mapping_config, normalization_config)
+
+    source_frame = pd.DataFrame([{"source_id": "loc-001", "source_country": "FR", "source_room": "HQ"}])
+    importer.import_rows(source_frame)
+
+    row = connection.execute('SELECT id, Country, City, Room FROM "Localisation"').fetchone()
+    assert row == ("loc-001", "FR", "toto", "HQ")
+
+
+def test_table_importer_ignores_mappings_to_unknown_target_columns() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.execute('CREATE TABLE "Localisation" (id TEXT PRIMARY KEY, Country TEXT, City TEXT, Room TEXT)')
+
+    schema = CMDBSchema(Path("db/cmdb_2026-06-28T15_49_08.585Z.sql"))
+    mapping_config = MappingConfig(
+        rules=[
+            MappingRule(source_column="source_id", target_column="id"),
+            MappingRule(source_column="source_city", target_column="source_city"),
+            MappingRule(source_column="source_room", target_column="source_room"),
+        ]
+    )
+    normalization_config = NormalizationConfig(rules=[])
+    importer = TableImporter(connection, schema, "Localisation", mapping_config, normalization_config)
+
+    source_frame = pd.DataFrame([{"source_id": "loc-001", "source_city": "Paris", "source_room": "HQ"}])
+    importer.import_rows(source_frame)
+
+    row = connection.execute('SELECT id FROM "Localisation"').fetchone()
+    assert row[0] == "loc-001"
 
 
 def test_table_importer_updates_existing_primary_key_rows_with_merge_rules() -> None:

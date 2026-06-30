@@ -217,6 +217,7 @@ class CMDBSchema:
 class MappingRule:
     source_column: str
     target_column: str
+    static_value: Any | None = None
     table: str | None = None
 
 
@@ -246,15 +247,28 @@ class MappingConfig:
         rules: list[MappingRule] = []
         for _, row in frame.iterrows():
             table = row.get("table") if "table" in frame.columns else None
-            source_column = str(row["source_column"]).strip()
-            target_column = str(row["target_column"]).strip()
+            source_value = row["source_column"]
+            target_value = row["target_column"]
+            if pd.isna(source_value) or pd.isna(target_value):
+                continue
+            source_column = str(source_value).strip()
+            target_column = str(target_value).strip()
             if not source_column or not target_column:
                 continue
+            if source_column.lower() == "nan":
+                continue
+
+            static_value: Any | None = None
+            if source_column.startswith("*"):
+                static_value = source_column[1:].strip()
+                source_column = ""
+
             if table is None or pd.isna(table) or str(table).strip() == table_name:
                 rules.append(
                     MappingRule(
                         source_column=source_column,
                         target_column=target_column,
+                        static_value=static_value,
                         table=str(table).strip() if pd.notna(table) else None,
                     )
                 )
@@ -375,15 +389,22 @@ class TableImporter:
         if frame.empty:
             return pd.DataFrame(columns=self.table_columns)
 
-        column_map = self.mapping_config.get_column_mapping()
-        missing_source_columns = [source_column for source_column in column_map if source_column not in frame.columns]
+        valid_rules = [rule for rule in self.mapping_config.rules if rule.target_column in self.table_columns]
+        source_rules = [rule for rule in valid_rules if rule.source_column]
+        missing_source_columns = [rule.source_column for rule in source_rules if rule.source_column not in frame.columns]
         if missing_source_columns:
             raise ValueError(
                 "Mapping file references source columns that are missing from the imported data: "
                 f"{', '.join(missing_source_columns)}"
             )
 
-        mapped_frame = frame.rename(columns=column_map)
+        mapped_frame = pd.DataFrame(index=frame.index)
+        for rule in valid_rules:
+            if rule.static_value is not None:
+                mapped_frame[rule.target_column] = rule.static_value
+            else:
+                mapped_frame[rule.target_column] = frame[rule.source_column]
+
         unknown_target_columns = [column for column in mapped_frame.columns if column not in self.table_columns]
         if unknown_target_columns:
             raise ValueError(
